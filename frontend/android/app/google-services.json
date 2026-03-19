@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "398306488324",
+    "project_id": "software-developement",
+    "storage_bucket": "software-developement.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:398306488324:android:5113404ebe8977ca268551",
+        "android_client_info": {
+          "package_name": "com.emergency.app.emergency_tracking"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDb-0Gim6dpfUelegKOwnN4gd5X4rNSzp4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
