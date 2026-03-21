@@ -29,6 +29,7 @@ class _DashboardScreenState extends State<DashboardScreen>
   String? _lastAlertMessage;
   DateTime? _lastAlertTime;
   bool _isLoggingOut = false;
+  bool _voiceNotificationsEnabled = true;
 
   Timer? _locationTimer;
   Timer? _proximityTimer;
@@ -101,6 +102,7 @@ class _DashboardScreenState extends State<DashboardScreen>
       role = prefs.getString('role') ?? "public";
       isEmergencyActive = prefs.getBool('emergency_active') ?? false;
       _userId = prefs.getString('user_id');
+      _voiceNotificationsEnabled = prefs.getBool('voice_notifications_enabled') ?? true;
 
       _lastAlertDocId = prefs.getString('last_alert_doc_id');
       _lastAlertMessage = prefs.getString('last_alert_message');
@@ -358,6 +360,26 @@ class _DashboardScreenState extends State<DashboardScreen>
     }
   }
 
+  Future<void> _toggleVoiceNotifications() async {
+    final newValue = !_voiceNotificationsEnabled;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('voice_notifications_enabled', newValue);
+
+    if (mounted) {
+      setState(() {
+        _voiceNotificationsEnabled = newValue;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Voice alerts ${newValue ? 'enabled' : 'disabled'}',
+          ),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    }
+  }
+
   void _startProximityScanner() {
     _proximityTimer?.cancel();
     _runAmbulanceAlertCycle(forceImmediate: true);
@@ -428,6 +450,8 @@ class _DashboardScreenState extends State<DashboardScreen>
             const SizedBox(height: 40),
             if (role == 'driver') _buildDriverEmergencyPanel(),
             if (role == 'public') _buildPublicStatusPanel(),
+            const SizedBox(height: 40),
+            _buildSettingsPanel(),
           ],
         ),
       ),
@@ -712,6 +736,63 @@ class _DashboardScreenState extends State<DashboardScreen>
                 ],
               ],
             ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSettingsPanel() {
+    return Container(
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(15),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.05),
+            blurRadius: 10,
+            spreadRadius: 2,
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Row(
+            children: [
+              Icon(Icons.settings, color: AppColors.primaryBlue),
+              SizedBox(width: 10),
+              Text(
+                "Settings",
+                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+              ),
+            ],
+          ),
+          const Divider(height: 20),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    "Voice Alerts",
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  SizedBox(height: 4),
+                  Text(
+                    "Speak emergency alerts aloud",
+                    style: TextStyle(fontSize: 12, color: Colors.grey),
+                  ),
+                ],
+              ),
+              Switch(
+                value: _voiceNotificationsEnabled,
+                onChanged: (_) => _toggleVoiceNotifications(),
+                activeThumbColor: AppColors.primaryBlue,
+              ),
+            ],
           ),
         ],
       ),

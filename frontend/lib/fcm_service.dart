@@ -5,6 +5,7 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/foundation.dart';
 import 'dart:async';
+import 'services/voice_notification_service.dart';
 
 class FcmService {
   static final FirebaseMessaging _firebaseMessaging = FirebaseMessaging.instance;
@@ -27,6 +28,9 @@ class FcmService {
     if (_initialized) {
       return _firebaseMessaging.getToken();
     }
+
+    // Initialize VoiceNotificationService for TTS
+    await VoiceNotificationService().initialize();
 
     // 1. Request permission
     NotificationSettings settings = await _firebaseMessaging.requestPermission(
@@ -123,6 +127,11 @@ class FcmService {
   }
 
   static Future<void> _showLocalNotification(String title, String body) async {
+    // Check if user has enabled voice notifications
+    final prefs = await SharedPreferences.getInstance();
+    final voiceNotificationsEnabled =
+        prefs.getBool('voice_notifications_enabled') ?? true; // Default to enabled
+
     const AndroidNotificationDetails androidPlatformChannelSpecifics =
         AndroidNotificationDetails(
       'emergency_ambulance_channel',
@@ -138,6 +147,12 @@ class FcmService {
       body: body,
       notificationDetails: platformChannelSpecifics,
     );
+
+    // Play voice notification if enabled
+    if (voiceNotificationsEnabled) {
+      final voiceMessage = '$title. $body';
+      await VoiceNotificationService().speakAlert(voiceMessage);
+    }
   }
 
   static Future<void> showEmergencyLocalNotification({
