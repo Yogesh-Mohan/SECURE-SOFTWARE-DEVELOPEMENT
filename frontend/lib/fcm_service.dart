@@ -4,14 +4,30 @@ import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/foundation.dart';
+import 'dart:async';
 
 class FcmService {
   static final FirebaseMessaging _firebaseMessaging = FirebaseMessaging.instance;
   static final FlutterLocalNotificationsPlugin _localNotificationsPlugin =
       FlutterLocalNotificationsPlugin();
+  static const AndroidNotificationChannel _emergencyChannel =
+      AndroidNotificationChannel(
+    'emergency_ambulance_channel',
+    'Emergency Alerts',
+    description: 'Ambulance proximity alerts',
+    importance: Importance.max,
+  );
   static const String emergencyMessage = '🚨 Ambulance coming – move left';
+  static bool _initialized = false;
+  static StreamSubscription<RemoteMessage>? _onMessageSubscription;
+  static StreamSubscription<RemoteMessage>? _onMessageOpenedAppSubscription;
+  static StreamSubscription<String>? _onTokenRefreshSubscription;
 
   static Future<String?> initialize() async {
+    if (_initialized) {
+      return _firebaseMessaging.getToken();
+    }
+
     // 1. Request permission
     NotificationSettings settings = await _firebaseMessaging.requestPermission(
       alert: true,
@@ -32,6 +48,10 @@ class FcmService {
     const InitializationSettings initializationSettings =
         InitializationSettings(android: initializationSettingsAndroid);
     await _localNotificationsPlugin.initialize(settings: initializationSettings);
+    await _localNotificationsPlugin
+      .resolvePlatformSpecificImplementation<
+        AndroidFlutterLocalNotificationsPlugin>()
+      ?.createNotificationChannel(_emergencyChannel);
     await _firebaseMessaging.setForegroundNotificationPresentationOptions(
       alert: true,
       badge: true,
@@ -46,10 +66,11 @@ class FcmService {
     }
 
     // Refresh token listener
-    _firebaseMessaging.onTokenRefresh.listen(_updateTokenInFirestore);
+    _onTokenRefreshSubscription =
+      _firebaseMessaging.onTokenRefresh.listen(_updateTokenInFirestore);
 
     // 4. Foreground Message Listener
-    FirebaseMessaging.onMessage.listen((RemoteMessage message) {
+    _onMessageSubscription = FirebaseMessaging.onMessage.listen((RemoteMessage message) {
       debugPrint('Got a message whilst in the foreground!');
       debugPrint('Message data: ${message.data}');
 
@@ -61,7 +82,8 @@ class FcmService {
       }
     });
 
-    FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) {
+    _onMessageOpenedAppSubscription =
+        FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) {
       final title = message.notification?.title ?? 'Emergency Alert';
       final body = message.notification?.body ?? emergencyMessage;
       _showLocalNotification(title, body);
@@ -74,7 +96,18 @@ class FcmService {
       await _showLocalNotification(title, body);
     }
     
+    _initialized = true;
     return token;
+  }
+
+  static Future<void> dispose() async {
+    await _onMessageSubscription?.cancel();
+    await _onMessageOpenedAppSubscription?.cancel();
+    await _onTokenRefreshSubscription?.cancel();
+    _onMessageSubscription = null;
+    _onMessageOpenedAppSubscription = null;
+    _onTokenRefreshSubscription = null;
+    _initialized = false;
   }
 
   static Future<void> _updateTokenInFirestore(String token) async {
@@ -84,7 +117,7 @@ class FcmService {
       await FirebaseFirestore.instance
           .collection('users')
           .doc(userId)
-          .update({'fcm_token': token})
+          .set({'fcm_token': token, 'updatedAt': FieldValue.serverTimestamp()}, SetOptions(merge: true))
           .catchError((e) => debugPrint("Failed to update token: $e"));
     }
   }

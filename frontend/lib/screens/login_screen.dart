@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
-import '../api_service.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:geolocator/geolocator.dart';
+import '../services/auth_service.dart';
 import '../theme.dart';
 
 class LoginScreen extends StatefulWidget {
@@ -10,68 +12,188 @@ class LoginScreen extends StatefulWidget {
 }
 
 class _LoginScreenState extends State<LoginScreen> {
-  final _mobileController = TextEditingController();
+  final _formKey = GlobalKey<FormState>();
+  final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
-  bool isLoading = false;
+  bool _isLoading = false;
+  bool _obscurePassword = true;
 
-  void handleLogin() async {
-    setState(() => isLoading = true);
+  Future<void> _requestCorePermissions() async {
+    await Permission.notification.request();
+    await Geolocator.requestPermission();
+  }
+
+  bool _isValidEmail(String email) {
+    final emailRegex = RegExp(r'^[^\s@]+@[^\s@]+\.[^\s@]+$');
+    return emailRegex.hasMatch(email);
+  }
+
+  Future<void> _handleLogin() async {
+    if (!_formKey.currentState!.validate()) return;
+
+    setState(() => _isLoading = true);
     try {
-      final res = await ApiService.login(_mobileController.text, _passwordController.text);
+      final res = await AuthService.loginWithEmail(
+        email: _emailController.text.trim(),
+        password: _passwordController.text,
+      );
+
       if (!mounted) return;
-      
-      if (res.containsKey('access_token')) {
+
+      if (res['success'] == true) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Row(
+              children: [
+                Icon(Icons.check_circle, color: Colors.white),
+                SizedBox(width: 12),
+                Text('Login successful!'),
+              ],
+            ),
+            backgroundColor: AppColors.success,
+          ),
+        );
+        await _requestCorePermissions();
+        if (!mounted) return;
         Navigator.pushReplacementNamed(context, '/dashboard');
+      } else if (res['needsVerification'] == true) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(res['error'] ?? 'Email not verified'),
+            backgroundColor: AppColors.primaryRed,
+            duration: const Duration(seconds: 4),
+            action: SnackBarAction(
+              label: 'VERIFY',
+              textColor: Colors.white,
+              onPressed: () {
+                Navigator.pushNamed(
+                  context,
+                  '/email-verification',
+                  arguments: {
+                    'email': _emailController.text.trim(),
+                    'name': '',
+                  },
+                );
+              },
+            ),
+          ),
+        );
       } else {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(res['detail'] ?? "Login failed"))
+          SnackBar(
+            content: Text(res['error'] ?? 'Login failed'),
+            backgroundColor: AppColors.primaryRed,
+          ),
         );
       }
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Error: Connection failed"))
-      );
     } finally {
-      if (mounted) {
-        setState(() => isLoading = false);
-      }
+      if (mounted) setState(() => _isLoading = false);
     }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: Center(
+      backgroundColor: AppColors.background,
+      body: SafeArea(
         child: SingleChildScrollView(
-          padding: const EdgeInsets.all(30),
+          padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 40),
           child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Icon(Icons.medical_services, size: 100, color: AppColors.primaryEmergency),
-              const SizedBox(height: 10),
-              const Text("LIFE-TRACK", style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: AppColors.darkBlue)),
-              const Text("Real-time Emergency Coordination", style: TextStyle(color: Colors.grey)),
-              const SizedBox(height: 50),
-              TextField(
-                controller: _mobileController,
-                decoration: const InputDecoration(labelText: "Mobile Number", prefixIcon: Icon(Icons.phone)),
-                keyboardType: TextInputType.phone,
-              ),
-              const SizedBox(height: 20),
-              TextField(
-                controller: _passwordController,
-                decoration: const InputDecoration(labelText: "Password", prefixIcon: Icon(Icons.lock)),
-                obscureText: true,
-              ),
               const SizedBox(height: 30),
-              isLoading 
-                ? const CircularProgressIndicator(color: AppColors.primaryEmergency)
-                : ElevatedButton(onPressed: handleLogin, child: const Text("LOGIN")),
-              const SizedBox(height: 20),
-              TextButton(
-                onPressed: () => Navigator.pushNamed(context, '/register'),
-                child: const Text("Don't have an account? REGISTER", style: TextStyle(color: AppColors.accentMedium)),
+              // App Logo
+              Container(
+                width: 80,
+                height: 80,
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(18),
+                  boxShadow: [
+                    BoxShadow(
+                      color: AppColors.primaryRed.withValues(alpha: 0.1),
+                      blurRadius: 15,
+                      offset: const Offset(0, 5),
+                    ),
+                  ],
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.all(8.0),
+                  child: Image.asset('assets/app_logo.png'),
+                ),
+              ),
+              const SizedBox(height: 32),
+              const Text(
+                'Digital Traffic',
+                style: TextStyle(
+                  fontSize: 34,
+                  fontWeight: FontWeight.w900,
+                  color: AppColors.textPrimary,
+                  letterSpacing: -0.5,
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Log in to the Bubble System dashboard.',
+                style: TextStyle(color: AppColors.textSecondary, fontSize: 16),
+              ),
+              const SizedBox(height: 50),
+
+              Form(
+                key: _formKey,
+                child: Column(
+                  children: [
+                    TextFormField(
+                      controller: _emailController,
+                      keyboardType: TextInputType.emailAddress,
+                      validator: (v) => _isValidEmail(v ?? '') ? null : 'Enter valid email',
+                      decoration: const InputDecoration(
+                        labelText: 'Email Address',
+                        prefixIcon: Icon(Icons.email_outlined),
+                      ),
+                    ),
+                    const SizedBox(height: 24),
+                    TextFormField(
+                      controller: _passwordController,
+                      obscureText: _obscurePassword,
+                      validator: (v) => (v != null && v.isNotEmpty) ? null : 'Enter valid password',
+                      decoration: InputDecoration(
+                        labelText: 'Password',
+                        prefixIcon: const Icon(Icons.lock_outline_rounded),
+                        suffixIcon: IconButton(
+                          icon: Icon(
+                            _obscurePassword ? Icons.visibility_off : Icons.visibility,
+                          ),
+                          onPressed: () => setState(() => _obscurePassword = !_obscurePassword),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 44),
+                    _isLoading
+                        ? const CircularProgressIndicator()
+                        : ElevatedButton(
+                            onPressed: _handleLogin,
+                            child: const Text('LOGIN'),
+                          ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 32),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Text('Don\'t have an account? '),
+                  GestureDetector(
+                    onTap: () => Navigator.pushNamed(context, '/register'),
+                    child: const Text(
+                      'Register Now',
+                      style: TextStyle(
+                        color: AppColors.primaryBlue,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ],
           ),

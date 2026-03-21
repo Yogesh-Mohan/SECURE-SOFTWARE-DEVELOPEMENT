@@ -4,34 +4,30 @@ from pymongo import MongoClient
 from pymongo.errors import ServerSelectionTimeoutError, OperationFailure
 from bson import ObjectId
 from pydantic import BaseModel, Field, ConfigDict, ValidationError
-from typing import Any, List, Optional
+from typing import List, Optional
 import os
 import logging
-import asyncio
-import math
 import jwt
-import json
-import time
-import urllib.parse
-import urllib.request
-import urllib.error
 import bcrypt
+from pathlib import Path
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+
+try:
+    import firebase_admin  # type: ignore[import-not-found]
+    from firebase_admin import credentials, firestore, messaging  # type: ignore[import-not-found]
+except Exception:
+    firebase_admin = None
+    credentials = None
+    firestore = None
+    messaging = None
 
 load_dotenv()
 
 # JWT configuration
-SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
+SECRET_KEY = os.getenv("cDKPAUB919U6MXroXlbS63Y81vSlIlVX", "your-secret-key-change-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
-ALERT_RADIUS_METERS = float(os.getenv("ALERT_RADIUS_METERS", "300"))
-ALERT_SCAN_INTERVAL_SECONDS = int(os.getenv("ALERT_SCAN_INTERVAL_SECONDS", "5"))
-ALERT_DEDUPE_SECONDS = int(os.getenv("ALERT_DEDUPE_SECONDS", "60"))
-FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "")
-REQUIRE_NOTIFY_AUTH = os.getenv("REQUIRE_NOTIFY_AUTH", "false").lower() in ("1", "true", "yes")
-
-alert_worker_task: Optional[asyncio.Task] = None
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -60,6 +56,12 @@ DATABASE_NAME = os.getenv("DATABASE_NAME", "admin")
 users_collection = None
 ambulance_collection = None
 alerts_collection = None
+pending_users_collection = None
+
+# Firebase Auth/OTP collections (MongoDB-independent)
+firestore_db = None
+otp_pending_collection = None
+auth_users_collection = None
 
 try:
     client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=5000)
@@ -71,11 +73,51 @@ try:
     users_collection = db["users"]
     ambulance_collection = db["ambulance"]
     alerts_collection = db["alerts"]
+    pending_users_collection = db["pending_users"]
     
     logger.info("✓ Connected to MongoDB successfully")
 except (ServerSelectionTimeoutError, OperationFailure) as e:
     logger.error(f"✗ MongoDB connection failed: {e}")
-    raise RuntimeError(f"Failed to connect to MongoDB at {MONGO_URL}")
+
+
+def _init_firestore():
+    global firestore_db, otp_pending_collection, auth_users_collection
+    try:
+        if firebase_admin is None or credentials is None or firestore is None:
+            logger.error("✗ firebase-admin package is not installed")
+            return
+
+        if not firebase_admin._apps:
+            cred_env = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH", "").strip()
+            cred_path = None
+
+            if cred_env:
+                candidate = Path(cred_env)
+                if candidate.exists():
+                    cred_path = candidate
+
+            if cred_path is None:
+                root_dir = Path(__file__).resolve().parent.parent
+                matches = sorted(root_dir.glob("*firebase-adminsdk*.json"))
+                if matches:
+                    cred_path = matches[0]
+
+            if cred_path is not None:
+                firebase_admin.initialize_app(credentials.Certificate(str(cred_path)))
+                logger.info(f"✓ Firebase Admin initialized using service account: {cred_path.name}")
+            else:
+                firebase_admin.initialize_app()
+                logger.info("✓ Firebase Admin initialized using default credentials")
+
+        firestore_db = firestore.client()
+        otp_pending_collection = firestore_db.collection("otp_pending_users")
+        auth_users_collection = firestore_db.collection("auth_users")
+        logger.info("✓ Firestore collections initialized for OTP auth")
+    except Exception as e:
+        logger.error(f"✗ Firebase/Firestore initialization failed: {e}")
+
+
+_init_firestore()
 
 
 # Pydantic models for request/response
@@ -162,24 +204,8 @@ class LocationUpdate(BaseModel):
 
 class EmergencyStatus(BaseModel):
     active: bool
-
-
-class NearbyUserNotification(BaseModel):
-    user_id: str = Field(..., min_length=1)
-    fcm_token: str = Field(..., min_length=1)
-
-
-class NotifyNearbyRequest(BaseModel):
-    nearby_users: List[NearbyUserNotification] = Field(default_factory=list)
-    message: str = Field(default="🚨 Ambulance coming – move left")
-
-
-class AuthResponse(BaseModel):
-    access_token: str
-    user_id: str
-    name: str
-    role: str
-    message: str
+    latitude: Optional[float] = None  # Emergency location for instant alerts
+    longitude: Optional[float] = None
 
 
 class AuthResponse(BaseModel):
@@ -224,244 +250,72 @@ def verify_token(token: str):
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
-def _extract_lat_lng(doc: dict) -> Optional[tuple]:
-    """Normalize location coordinates from nested or flat schema."""
-    location = doc.get("location")
-    if isinstance(location, dict):
-        lat = location.get("lat")
-        lng = location.get("lng")
-        if lat is not None and lng is not None:
-            return float(lat), float(lng)
-
-    lat = doc.get("latitude")
-    lng = doc.get("longitude")
-    if lat is not None and lng is not None:
-        return float(lat), float(lng)
-
-    return None
-
-
-def haversine_distance_meters(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    """Calculate distance between two geo points in meters."""
-    radius = 6371000
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    d_phi = math.radians(lat2 - lat1)
-    d_lambda = math.radians(lng2 - lng1)
-
-    a = math.sin(d_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return radius * c
+def haversine_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """Calculate distance between two coordinates in meters using Haversine formula"""
+    from math import radians, cos, sin, asin, sqrt
+    
+    # Convert degrees to radians
+    lat1, lng1, lat2, lng2 = map(radians, [lat1, lng1, lat2, lng2])
+    
+    # Haversine formula
+    dlat = lat2 - lat1
+    dlng = lng2 - lng1
+    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlng/2)**2
+    c = 2 * asin(sqrt(a))
+    r = 6371000  # Radius of earth in meters
+    return c * r
 
 
-def trigger_alert_placeholder(user_doc: dict, message: str) -> None:
-    """Notification placeholder. Replace with push/SMS integration later."""
-    logger.info("Alert triggered for user=%s message=%s", user_doc.get("_id"), message)
-
-
-def _load_firebase_service_account() -> dict:
-    """Load Firebase service account from env JSON or env file path."""
-    raw_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
-    json_path = os.getenv("FIREBASE_SERVICE_ACCOUNT_FILE")
-
-    if raw_json:
-        data = json.loads(raw_json)
-    elif json_path:
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    else:
-        raise RuntimeError(
-            "Missing Firebase credentials. Set FIREBASE_SERVICE_ACCOUNT_JSON or FIREBASE_SERVICE_ACCOUNT_FILE"
-        )
-
-    private_key = data.get("private_key", "")
-    if isinstance(private_key, str):
-        data["private_key"] = private_key.replace("\\n", "\n")
-
-    return data
-
-
-def _fetch_google_access_token(service_account: dict) -> str:
-    """Create OAuth2 access token for Firebase Cloud Messaging HTTP v1."""
-    now = int(time.time())
-    token_uri = service_account.get("token_uri", "https://oauth2.googleapis.com/token")
-    claims = {
-        "iss": service_account["client_email"],
-        "scope": "https://www.googleapis.com/auth/firebase.messaging",
-        "aud": token_uri,
-        "iat": now,
-        "exp": now + 3600,
-    }
-
-    assertion = jwt.encode(
-        claims,
-        service_account["private_key"],
-        algorithm="RS256",
-    )
-
-    body = urllib.parse.urlencode(
-        {
-            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-            "assertion": assertion,
-        }
-    ).encode("utf-8")
-
-    req = urllib.request.Request(
-        token_uri,
-        data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        method="POST",
-    )
-
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
-
-    access_token = payload.get("access_token")
-    if not access_token:
-        raise RuntimeError("Unable to obtain Google access token")
-    return access_token
-
-
-def _send_fcm_notification(
-    *,
-    fcm_token: str,
-    message: str,
-    project_id: str,
-    access_token: str,
-) -> tuple[bool, str]:
-    """Send one FCM notification via HTTP v1."""
-    endpoint = f"https://fcm.googleapis.com/v1/projects/{project_id}/messages:send"
-    payload = {
-        "message": {
-            "token": fcm_token,
-            "notification": {
-                "title": "Emergency Alert",
-                "body": message,
-            },
-            "android": {
-                "priority": "high",
-            },
-        }
-    }
-
-    req = urllib.request.Request(
-        endpoint,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {access_token}",
-        },
-        method="POST",
-    )
-
+def get_nearby_users_from_firestore(
+    driver_lat: float, 
+    driver_lng: float, 
+    radius_meters: float = 300
+) -> List[dict]:
+    """
+    Query Firestore for users within radius_meters of driver location.
+    Returns list of user docs with id, name, and fcm_token.
+    """
+    if firestore_db is None:
+        return []
+    
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            if 200 <= resp.status < 300:
-                return True, "ok"
-            return False, f"HTTP {resp.status}"
-    except urllib.error.HTTPError as ex:
-        try:
-            reason = ex.read().decode("utf-8")
-        except Exception:
-            reason = str(ex)
-        return False, reason
-    except Exception as ex:
-        return False, str(ex)
-
-
-def run_ambulance_priority_cycle() -> dict:
-    """Run one cycle: detect nearby users and store alerts."""
-    if users_collection is None or ambulance_collection is None or alerts_collection is None:
-        raise RuntimeError("Database collections not initialized")
-
-    cycle_time = datetime.utcnow()
-    total_alerts = 0
-    active_ambulances = 0
-
-    users = list(users_collection.find({}, {"location": 1, "latitude": 1, "longitude": 1}))
-
-    for ambulance in ambulance_collection.find({}):
-        if not ambulance.get("is_active", False):
-            continue
-
-        ambulance_location = _extract_lat_lng(ambulance)
-        if ambulance_location is None:
-            continue
-
-        active_ambulances += 1
-        ambulance_lat, ambulance_lng = ambulance_location
-
-        for user in users:
-            user_location = _extract_lat_lng(user)
-            if user_location is None:
+        users_ref = firestore_db.collection('users')
+        users_snap = users_ref.stream()
+        
+        nearby_users = []
+        for user_doc in users_snap:
+            user_data = user_doc.to_dict() or {}
+            user_role = user_data.get('role', '')
+            
+            # Only include public users (people requesting ambulance)
+            if user_role != 'public':
                 continue
-
-            user_lat, user_lng = user_location
-            distance_meters = haversine_distance_meters(ambulance_lat, ambulance_lng, user_lat, user_lng)
-            if distance_meters > ALERT_RADIUS_METERS:
+            
+            location = user_data.get('location', {})
+            user_lat = location.get('lat', 0)
+            user_lng = location.get('lng', 0)
+            
+            # Skip invalid locations
+            if user_lat == 0 and user_lng == 0:
                 continue
-
-            message = "Ambulance coming - move left/right"
-            trigger_alert_placeholder(user, message)
-
-            alerts_collection.insert_one(
-                {
-                    "user_id": str(user.get("_id")),
-                    "ambulance_id": str(ambulance.get("_id")),
-                    "message": message,
-                    "timestamp": cycle_time,
-                    "distance_meters": round(distance_meters, 2),
-                }
-            )
-            total_alerts += 1
-
-    return {
-        "active_ambulances": active_ambulances,
-        "alerts_created": total_alerts,
-        "radius_meters": ALERT_RADIUS_METERS,
-        "timestamp": cycle_time,
-    }
-
-
-async def ambulance_priority_worker() -> None:
-    """Background loop to evaluate ambulance proximity continuously."""
-    while True:
-        try:
-            result = run_ambulance_priority_cycle()
-            if result["alerts_created"]:
-                logger.info(
-                    "Priority cycle complete: active_ambulances=%s alerts_created=%s",
-                    result["active_ambulances"],
-                    result["alerts_created"],
-                )
-        except Exception as ex:
-            logger.exception("Ambulance priority cycle failed: %s", ex)
-
-        await asyncio.sleep(ALERT_SCAN_INTERVAL_SECONDS)
-
-
-@app.on_event("startup")
-async def start_ambulance_priority_worker() -> None:
-    global alert_worker_task
-    if alert_worker_task is None:
-        alert_worker_task = asyncio.create_task(ambulance_priority_worker())
-        logger.info(
-            "Ambulance priority worker started (interval=%ss radius=%sm)",
-            ALERT_SCAN_INTERVAL_SECONDS,
-            ALERT_RADIUS_METERS,
-        )
-
-
-@app.on_event("shutdown")
-async def stop_ambulance_priority_worker() -> None:
-    global alert_worker_task
-    if alert_worker_task is not None:
-        alert_worker_task.cancel()
-        try:
-            await alert_worker_task
-        except asyncio.CancelledError:
-            pass
-        alert_worker_task = None
+            
+            # Calculate distance
+            distance = haversine_distance(driver_lat, driver_lng, user_lat, user_lng)
+            
+            # Include if within radius
+            if distance <= radius_meters:
+                nearby_users.append({
+                    'user_id': user_doc.id,
+                    'name': user_data.get('name', 'User'),
+                    'fcm_token': user_data.get('fcm_token', ''),
+                    'distance': distance,
+                })
+        
+        logger.info(f"Found {len(nearby_users)} nearby users within {radius_meters}m")
+        return nearby_users
+    except Exception as e:
+        logger.error(f"Error querying nearby users: {e}")
+        return []
 
 
 # Routes
@@ -725,27 +579,65 @@ def update_location(request: LocationUpdate, authorization: Optional[str] = Head
 
 @app.post("/emergency-status", tags=["Emergency"])
 def emergency_status(request: EmergencyStatus, authorization: Optional[str] = Header(None)):
-    """Toggle emergency status"""
-    if users_collection is None:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-    
+    """Toggle emergency status with instant FCM alert push to nearby users"""
     try:
-        # Extract token
-        if not authorization:
-            raise HTTPException(status_code=401, detail="Missing authorization header")
+        # Best-effort legacy MongoDB status update when JWT/ObjectId auth is available.
+        # Instant push should still work even if legacy auth/storage is not used.
+        if users_collection is not None and authorization:
+            try:
+                token = authorization.replace("Bearer ", "")
+                user_id = verify_token(token)
+                users_collection.update_one(
+                    {"_id": ObjectId(user_id)},
+                    {"$set": {"emergency_active": request.active, "updated_at": datetime.utcnow()}},
+                )
+                logger.info(f"Emergency status updated for legacy user: {user_id} - Active: {request.active}")
+            except Exception as legacy_error:
+                logger.warning(f"Skipping legacy MongoDB emergency update: {legacy_error}")
         
-        token = authorization.replace("Bearer ", "")
-        user_id = verify_token(token)
+        # ==== INSTANT FCM PUSH TO NEARBY USERS ====
+        alert_count = 0
+        if request.active and request.latitude is not None and request.longitude is not None:
+            try:
+                nearby_users = get_nearby_users_from_firestore(request.latitude, request.longitude)
+                
+                # Extract valid FCM tokens
+                fcm_tokens = [u['fcm_token'] for u in nearby_users if u.get('fcm_token')]
+                alert_count = len(fcm_tokens)
+                
+                if fcm_tokens and messaging is not None:
+                    logger.info(f"Sending instant FCM to {len(fcm_tokens)} nearby users")
+                    
+                    try:
+                        message = messaging.MulticastMessage(
+                            notification=messaging.Notification(
+                                title="🚨 Emergency Alert!",
+                                body="Ambulance coming to your location - move left if safe",
+                            ),
+                            android=messaging.AndroidConfig(
+                                priority="high",
+                                notification=messaging.AndroidNotification(
+                                    sound="default",
+                                    channel_id="emergency_ambulance_channel",
+                                    priority="max",
+                                ),
+                            ),
+                            tokens=fcm_tokens,
+                        )
+                        response = messaging.send_each_for_multicast(message)
+                        logger.info(f"Instant FCM sent: {response.success_count} success, {response.failure_count} failed")
+                    except Exception as fcm_error:
+                        logger.error(f"FCM send error: {fcm_error}")
+                else:
+                    logger.warning(f"No valid FCM tokens found for {len(nearby_users)} nearby users")
+            except Exception as e:
+                logger.error(f"Error in instant FCM push: {e}")
         
-        # Update emergency status
-        users_collection.update_one(
-            {"_id": ObjectId(user_id)},
-            {"$set": {"emergency_active": request.active, "updated_at": datetime.utcnow()}}
-        )
-        
-        logger.info(f"Emergency status updated for user: {user_id} - Active: {request.active}")
-        
-        return {"message": "Emergency status updated", "active": request.active}
+        return {
+            "message": "Emergency status updated",
+            "active": request.active,
+            "alerts_sent": alert_count
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -753,103 +645,473 @@ def emergency_status(request: EmergencyStatus, authorization: Optional[str] = He
         raise HTTPException(status_code=500, detail="Failed to update emergency status")
 
 
-@app.post("/ambulance-priority/run-once", tags=["Emergency"])
-def run_priority_once() -> dict:
-    """Manual trigger for one ambulance priority cycle."""
+# ============ NEW OTP-BASED AUTHENTICATION ENDPOINTS ============
+
+@app.post("/register-initiate", tags=["Auth-OTP"])
+def register_initiate(email: str, password: str, name: str, role: str):
+    """
+    Initiate registration with email OTP verification
+    - Generates 6-digit OTP and sends to email
+    - Returns pending_user_id to use for /verify-otp
+    """
+    if otp_pending_collection is None or auth_users_collection is None:
+        raise HTTPException(status_code=500, detail="Firestore connection failed")
+    
     try:
-        result = run_ambulance_priority_cycle()
-        result["timestamp"] = result["timestamp"].isoformat()
-        return {
-            "message": "Ambulance priority cycle executed",
-            **result,
+        from auth import generate_otp, send_otp_email, get_password_hash
+        
+        email = email.strip().lower()
+
+        # Check if email already registered
+        existing_user = list(auth_users_collection.where("email", "==", email).limit(1).stream())
+        if existing_user:
+            raise HTTPException(status_code=400, detail="Email already registered")
+        
+        # Check pending registration
+        existing_pending = list(otp_pending_collection.where("email", "==", email).limit(1).stream())
+        if existing_pending:
+            raise HTTPException(status_code=400, detail="Email already has pending registration")
+        
+        # Validate role
+        if role not in ["public", "driver"]:
+            raise HTTPException(status_code=400, detail="Invalid role")
+        
+        # Generate OTP
+        otp_code = generate_otp()
+        
+        # Create pending user
+        pending_user_doc = {
+            "email": email,
+            "name": name,
+            "password_hash": get_password_hash(password),
+            "role": role,
+            "otp_code": otp_code,
+            "otp_created_at": datetime.utcnow(),
+            "attempt_count": 0,
+            "resend_count": 0,
+            "resend_window_start": datetime.utcnow(),
+            "created_at": datetime.utcnow()
         }
-    except Exception as ex:
-        logger.error("Manual ambulance priority run failed: %s", ex)
-        raise HTTPException(status_code=500, detail="Failed to run ambulance priority cycle")
+        
+        pending_ref = otp_pending_collection.document()
+        pending_ref.set(pending_user_doc)
+        pending_user_id = pending_ref.id
+        
+        # Send OTP to email
+        email_sent = send_otp_email(email, otp_code)
+        if not email_sent:
+            # Avoid stale pending records when email delivery fails.
+            pending_ref.delete()
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to send OTP email. Check SMTP configuration and try again.",
+            )
+        
+        logger.info(f"Registration initiated for: {email} (Pending ID: {pending_user_id})")
+        
+        return {
+            "pending_user_id": pending_user_id,
+            "message": "OTP sent to email",
+            "email": email
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Register-initiate error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to initiate registration")
 
 
-@app.post("/alerts/notify-nearby", tags=["Emergency"])
-def notify_nearby_users(
-    request: NotifyNearbyRequest,
-    authorization: Optional[str] = Header(None),
-) -> dict:
-    """Securely send nearby-user FCM alerts from backend and persist audit logs."""
-    if alerts_collection is None:
-        raise HTTPException(status_code=500, detail="Database connection failed")
+@app.post("/verify-otp", tags=["Auth-OTP"])
+def verify_otp(pending_user_id: str, otp_code: str):
+    """
+    Verify OTP and complete registration
+    - Creates user document in users collection
+    - Returns auth token for auto-login
+    """
+    if otp_pending_collection is None or auth_users_collection is None:
+        raise HTTPException(status_code=500, detail="Firestore connection failed")
+    
+    try:
+        from auth import create_access_token
+        
+        pending_ref = otp_pending_collection.document(pending_user_id)
+        pending_snap = pending_ref.get()
+        if not pending_snap.exists:
+            raise HTTPException(status_code=404, detail="Pending user not found")
 
-    if REQUIRE_NOTIFY_AUTH:
-        if users_collection is None:
-            raise HTTPException(status_code=500, detail="Database connection failed")
+        pending_user = pending_snap.to_dict() or {}
+        
+        # Check expiry (10 minutes)
+        otp_age = datetime.utcnow() - pending_user["otp_created_at"]
+        if otp_age > timedelta(minutes=10):
+            # Delete expired OTP
+            pending_ref.delete()
+            raise HTTPException(status_code=400, detail="OTP expired. Please register again.")
+        
+        # Check attempt limit
+        if pending_user.get("attempt_count", 0) >= 5:
+            pending_ref.delete()
+            raise HTTPException(status_code=400, detail="Too many failed attempts. Please register again.")
+        
+        # Verify OTP
+        if pending_user["otp_code"] != otp_code:
+            # Increment attempt count
+            pending_ref.update({"attempt_count": firestore.Increment(1)})
+            raise HTTPException(status_code=400, detail="Invalid OTP. Please try again.")
+        
+        # Create user document
+        user_doc = {
+            "email": pending_user["email"],
+            "name": pending_user["name"],
+            "password": pending_user["password_hash"],
+            "role": pending_user["role"],
+            "email_verified": True,
+            "location": {"lat": 0, "lng": 0},
+            "created_at": datetime.utcnow()
+        }
+        
+        # Insert user in Firestore auth collection
+        user_ref = auth_users_collection.document()
+        user_ref.set(user_doc)
+        user_id = user_ref.id
 
-        if not authorization:
-            raise HTTPException(status_code=401, detail="Missing authorization header")
+        # Optional driver profile for ambulance tracking in Firestore.
+        if pending_user["role"] == "driver" and firestore_db is not None:
+            firestore_db.collection("ambulance").document(user_id).set({
+                "driverUserId": user_id,
+                "driverName": pending_user["name"],
+                "email": pending_user["email"],
+                "status": "available",
+                "is_active": False,
+                "location": {"lat": 0, "lng": 0},
+                "created_at": datetime.utcnow(),
+            })
+        
+        # Delete pending user
+        pending_ref.delete()
+        
+        # Create token
+        token = create_access_token(data={"sub": user_id})
+        
+        logger.info(f"User registered via OTP: {user_id} ({pending_user['email']})")
+        
+        return {
+            "access_token": token,
+            "user_id": user_id,
+            "name": pending_user["name"],
+            "role": pending_user["role"],
+            "message": "Registration successful"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Verify-OTP error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to verify OTP")
 
-        token = authorization.replace("Bearer ", "")
-        caller_user_id = verify_token(token)
-        caller = users_collection.find_one({"_id": ObjectId(caller_user_id)}, {"role": 1})
-        if not caller:
-            raise HTTPException(status_code=401, detail="Invalid token")
 
-        if caller.get("role") != "driver":
-            raise HTTPException(status_code=403, detail="Driver role required")
+@app.post("/resend-otp", tags=["Auth-OTP"])
+def resend_otp(pending_user_id: str):
+    """
+    Resend OTP code to email
+    - Rate limited: max 5 resends per hour
+    """
+    if otp_pending_collection is None:
+        raise HTTPException(status_code=500, detail="Firestore connection failed")
+    
+    try:
+        from auth import generate_otp, send_otp_email
+        
+        pending_ref = otp_pending_collection.document(pending_user_id)
+        pending_snap = pending_ref.get()
+        if not pending_snap.exists:
+            raise HTTPException(status_code=404, detail="Pending user not found")
+
+        pending_user = pending_snap.to_dict() or {}
+        
+        # Check resend limit (5 per hour)
+        resend_window_start = pending_user.get("resend_window_start", datetime.utcnow())
+        time_since_window = datetime.utcnow() - resend_window_start
+        
+        if time_since_window > timedelta(hours=1):
+            # Reset window
+            pending_ref.update({"resend_count": 1, "resend_window_start": datetime.utcnow()})
+        else:
+            if pending_user.get("resend_count", 0) >= 5:
+                raise HTTPException(status_code=429, detail="Too many resend attempts. Try again after 1 hour.")
+            
+            # Increment resend count
+            pending_ref.update({"resend_count": firestore.Increment(1)})
+        
+        # Generate new OTP
+        otp_code = generate_otp()
+        
+        # Update OTP in pending user
+        pending_ref.update(
+            {
+                "otp_code": otp_code,
+                "otp_created_at": datetime.utcnow(),
+                "attempt_count": 0,
+            }
+        )
+        
+        # Send OTP to email
+        email_sent = send_otp_email(pending_user["email"], otp_code)
+        if not email_sent:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to resend OTP email. Check SMTP configuration and try again.",
+            )
+        
+        logger.info(f"OTP resent for: {pending_user['email']}")
+        
+        return {
+            "message": "OTP resent to email",
+            "email": pending_user["email"]
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Resend-OTP error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to resend OTP")
+
+
+@app.post("/login-email", tags=["Auth-OTP"])
+def login_email(email: str, password: str):
+    """
+    Login with email and password
+    - If email not verified, returns pending_user_id to complete OTP verification
+    """
+    if auth_users_collection is None:
+        raise HTTPException(status_code=500, detail="Firestore connection failed")
+    
+    try:
+        from auth import verify_password, create_access_token
+        
+        email = email.strip().lower()
+
+        # Find user by email
+        users = list(auth_users_collection.where("email", "==", email).limit(1).stream())
+        if not users:
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+
+        user = users[0].to_dict() or {}
+        user_id = users[0].id
+        
+        # Verify password
+        if not verify_password(password, user.get("password", "")):
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+        
+        # Check if email verified
+        if not user.get("email_verified", False):
+            # Check if there's a pending user for this email
+            pending = list(otp_pending_collection.where("email", "==", email).limit(1).stream())
+            if pending:
+                return {
+                    "status": "pending_verification",
+                    "pending_user_id": pending[0].id,
+                    "message": "Email not verified. Complete OTP verification."
+                }
+            else:
+                # Create pending user for verification
+                from auth import generate_otp, send_otp_email, get_password_hash
+                otp_code = generate_otp()
+                
+                pending_doc = {
+                    "email": email,
+                    "name": user.get("name", ""),
+                    "password_hash": user["password"],
+                    "role": user.get("role", "public"),
+                    "otp_code": otp_code,
+                    "otp_created_at": datetime.utcnow(),
+                    "attempt_count": 0,
+                    "resend_count": 0,
+                    "resend_window_start": datetime.utcnow(),
+                    "created_at": datetime.utcnow()
+                }
+                
+                pending_ref = otp_pending_collection.document()
+                pending_ref.set(pending_doc)
+                email_sent = send_otp_email(email, otp_code)
+                if not email_sent:
+                    pending_ref.delete()
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Failed to send OTP email. Check SMTP configuration and try again.",
+                    )
+                
+                return {
+                    "status": "pending_verification",
+                    "pending_user_id": pending_ref.id,
+                    "message": "Email not verified. OTP sent."
+                }
+
+        token = create_access_token(data={"sub": user_id})
+        
+        logger.info(f"User logged in via email: {user_id}")
+        
+        return {
+            "access_token": token,
+            "user_id": user_id,
+            "name": user["name"],
+            "role": user["role"],
+            "message": "Login successful"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Login-email error: {e}")
+        raise HTTPException(status_code=500, detail="Login failed")
+
+
+@app.post("/migrate-to-email", tags=["Auth-OTP"])
+def migrate_to_email(old_mobile: str, email: str, new_password: str):
+    """
+    Migrate old mobile-based account to email-based verification
+    - Finds user by mobile
+    - Adds email and sends OTP verification
+    """
+    if auth_users_collection is None or otp_pending_collection is None:
+        raise HTTPException(status_code=500, detail="Firestore connection failed")
+    
+    try:
+        from auth import generate_otp, send_otp_email, get_password_hash
+        
+        email = email.strip().lower()
+
+        # Find user by mobile
+        users = list(auth_users_collection.where("mobile", "==", old_mobile).limit(1).stream())
+        if not users:
+            raise HTTPException(status_code=404, detail="User not found")
+        user = users[0].to_dict() or {}
+        
+        # Check if email already exists
+        existing_email = list(auth_users_collection.where("email", "==", email).limit(1).stream())
+        if existing_email:
+            raise HTTPException(status_code=400, detail="Email already registered")
+        
+        existing_pending = list(otp_pending_collection.where("email", "==", email).limit(1).stream())
+        if existing_pending:
+            raise HTTPException(status_code=400, detail="Email already has pending registration")
+        
+        # Generate OTP
+        otp_code = generate_otp()
+        hashed_password = get_password_hash(new_password)
+        
+        # Create pending user for email verification
+        pending_doc = {
+            "email": email,
+            "name": user.get("name", ""),
+            "password_hash": hashed_password,
+            "role": user.get("role", "public"),
+            "otp_code": otp_code,
+            "otp_created_at": datetime.utcnow(),
+            "attempt_count": 0,
+            "resend_count": 0,
+            "resend_window_start": datetime.utcnow(),
+            "old_user_id": users[0].id,
+            "created_at": datetime.utcnow()
+        }
+        
+        pending_ref = otp_pending_collection.document()
+        pending_ref.set(pending_doc)
+        pending_user_id = pending_ref.id
+        
+        # Send OTP
+        email_sent = send_otp_email(email, otp_code)
+        if not email_sent:
+            pending_ref.delete()
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to send OTP email for migration. Check SMTP configuration and try again.",
+            )
+        
+        logger.info(f"Migration initiated for user: {users[0].id} to email: {email}")
+        
+        return {
+            "pending_user_id": pending_user_id,
+            "message": "OTP sent to email for migration",
+            "email": email
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Migrate-to-email error: {e}")
+        raise HTTPException(status_code=500, detail="Migration failed")
+
+
+class NotificationRequest(BaseModel):
+    token: str = Field(..., description="FCM device token")
+    title: str = Field(default="🚨 Emergency Alert", description="Notification title")
+    body: str = Field(default="🚨 Ambulance coming - move left", description="Notification body")
+
+
+@app.post("/send-notification", tags=["Notifications"])
+@app.post("/send-notification/", tags=["Notifications"])
+def send_notification(request: NotificationRequest):
+    """Send FCM push notification to a specific device token"""
+    if messaging is None:
+        raise HTTPException(status_code=500, detail="Firebase messaging not available")
 
     try:
-        service_account = _load_firebase_service_account()
-        project_id = FIREBASE_PROJECT_ID or service_account.get("project_id", "")
-        if not project_id:
-            raise RuntimeError("Missing Firebase project ID")
-
-        access_token = _fetch_google_access_token(service_account)
-    except Exception as ex:
-        logger.error("FCM configuration error: %s", ex)
-        raise HTTPException(status_code=500, detail="FCM backend is not configured")
-
-    notified_user_ids: List[str] = []
-    now = datetime.utcnow()
-    dedupe_since = now - timedelta(seconds=ALERT_DEDUPE_SECONDS)
-
-    for nearby_user in request.nearby_users:
-        user_id = nearby_user.user_id.strip()
-        fcm_token = nearby_user.fcm_token.strip()
-        if not user_id or not fcm_token:
-            continue
-
-        existing_alert = alerts_collection.find_one(
-            {
-                "user_id": user_id,
-                "message": request.message,
-                "timestamp": {"$gte": dedupe_since},
-            }
+        message = messaging.Message(
+            notification=messaging.Notification(
+                title=request.title,
+                body=request.body,
+            ),
+            android=messaging.AndroidConfig(
+                priority="high",
+                notification=messaging.AndroidNotification(
+                    sound="default",
+                    channel_id="emergency_ambulance_channel",
+                    priority="max",
+                ),
+            ),
+            token=request.token,
         )
-        if existing_alert:
-            continue
+        response = messaging.send(message)
+        logger.info(f"FCM notification sent: {response}")
+        return {"message": "Notification sent", "response": response}
+    except Exception as e:
+        logger.error(f"FCM send error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to send notification: {str(e)}")
 
-        sent, reason = _send_fcm_notification(
-            fcm_token=fcm_token,
-            message=request.message,
-            project_id=project_id,
-            access_token=access_token,
+
+@app.post("/send-notification-batch", tags=["Notifications"])
+def send_notification_batch(tokens: List[str], title: str = "🚨 Emergency Alert", body: str = "🚨 Ambulance coming - move left"):
+    """Send FCM push notification to multiple device tokens"""
+    if messaging is None:
+        raise HTTPException(status_code=500, detail="Firebase messaging not available")
+
+    try:
+        valid_tokens = [t for t in tokens if t and t.strip()]
+        if not valid_tokens:
+            return {"message": "No valid tokens", "success_count": 0}
+
+        message = messaging.MulticastMessage(
+            notification=messaging.Notification(
+                title=title,
+                body=body,
+            ),
+            android=messaging.AndroidConfig(
+                priority="high",
+                notification=messaging.AndroidNotification(
+                    sound="default",
+                    channel_id="emergency_ambulance_channel",
+                    priority="max",
+                ),
+            ),
+            tokens=valid_tokens,
         )
-        if not sent:
-            logger.warning("FCM send failed for user=%s reason=%s", user_id, reason)
-            continue
-
-        alerts_collection.insert_one(
-            {
-                "user_id": user_id,
-                "message": request.message,
-                "timestamp": now,
-                "source": "backend_fcm",
-            }
-        )
-        notified_user_ids.append(user_id)
-
-    return {
-        "message": "Nearby alert processing completed",
-        "requested": len(request.nearby_users),
-        "notified": len(notified_user_ids),
-        "notified_user_ids": notified_user_ids,
-    }
+        response = messaging.send_each_for_multicast(message)
+        logger.info(f"FCM batch: {response.success_count} sent, {response.failure_count} failed")
+        return {
+            "message": "Batch sent",
+            "success_count": response.success_count,
+            "failure_count": response.failure_count,
+        }
+    except Exception as e:
+        logger.error(f"FCM batch error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to send batch notification: {str(e)}")
 
 
 # Run with: uvicorn main:app --reload

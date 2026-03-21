@@ -1,11 +1,12 @@
 import 'package:flutter/material.dart';
-import 'package:geolocator/geolocator.dart'; 
-// import 'package:flutter_background_service/flutter_background_service.dart'; // TODO: Re-enable after fixing foreground notification
+import 'package:geolocator/geolocator.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'dart:async';
+import 'package:permission_handler/permission_handler.dart';
 import '../api_service.dart';
 import '../fcm_service.dart';
+import '../services/auth_service.dart';
 import '../theme.dart';
 
 class DashboardScreen extends StatefulWidget {
@@ -23,11 +24,11 @@ class _DashboardScreenState extends State<DashboardScreen>
   String trackingStatus = "Checking location...";
   double? lat;
   double? lon;
-  String? _fcmToken;
   String? _userId;
 
   String? _lastAlertMessage;
   DateTime? _lastAlertTime;
+  bool _isLoggingOut = false;
 
   Timer? _locationTimer;
   Timer? _proximityTimer;
@@ -39,29 +40,58 @@ class _DashboardScreenState extends State<DashboardScreen>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
 
-    _loadUserData().then((_) async {
-      String? token = await FcmService.initialize();
-      if (mounted) {
-        setState(() {
-          _fcmToken = token;
-        });
+    _initializeDashboard();
+  }
+
+  Future<void> _initializeDashboard() async {
+    await _loadUserData();
+    await _ensureAllPermissions();
+    await FcmService.initialize();
+    await _startTrackingIfAllowed();
+  }
+
+  Future<void> _ensureAllPermissions() async {
+    // 1. Request Notification Permission
+    final notificationStatus = await Permission.notification.status;
+    if (!notificationStatus.isGranted) {
+      final result = await Permission.notification.request();
+      if (result.isDenied || result.isPermanentlyDenied) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: const Text('Notification permission is required for emergency alerts!'),
+              backgroundColor: AppColors.primaryRed,
+              action: SnackBarAction(
+                label: 'SETTINGS',
+                textColor: Colors.white,
+                onPressed: () => openAppSettings(),
+              ),
+            ),
+          );
+        }
       }
-    });
-    _startTrackingIfAllowed();
+    }
 
-
-    // TODO: Listen for updates from background service (re-enable after notification fix)
-    // FlutterBackgroundService().on('update').listen((event) {
-    //   if (mounted) {
-    //     setState(() {
-    //       lat = event?['lat'];
-    //       lon = event?['lon'];
-    //       trackingStatus = (role == 'driver' && isEmergencyActive)
-    //           ? "Emergency active"
-    //           : "Tracking active";
-    //     });
-    //   }
-    // });
+    // 2. Request Location Permission
+    final locationStatus = await Permission.location.status;
+    if (!locationStatus.isGranted) {
+      final result = await Permission.location.request();
+      if (result.isDenied || result.isPermanentlyDenied) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: const Text('Location permission is required for tracking and alerts!'),
+              backgroundColor: AppColors.primaryRed,
+              action: SnackBarAction(
+                label: 'SETTINGS',
+                textColor: Colors.white,
+                onPressed: () => openAppSettings(),
+              ),
+            ),
+          );
+        }
+      }
+    }
   }
 
   Future<void> _loadUserData() async {
@@ -102,43 +132,63 @@ class _DashboardScreenState extends State<DashboardScreen>
     _alertsSubscription = FirebaseFirestore.instance
         .collection('alerts')
         .where('user_id', isEqualTo: userId)
-        .orderBy('timestamp', descending: true)
-        .limit(1)
         .snapshots()
         .listen((snapshot) async {
-      if (snapshot.docs.isEmpty) {
-        return;
+      // Only process ADDED documents (new alerts)
+      for (final change in snapshot.docChanges) {
+        if (change.type != DocumentChangeType.added) {
+          continue;
+        }
+
+        final doc = change.doc;
+        if (doc.id == _lastAlertDocId) {
+          continue;
+        }
+
+        _lastAlertDocId = doc.id;
+        final data = doc.data() ?? {};
+        final message = (data['message'] ?? FcmService.emergencyMessage).toString();
+
+        debugPrint('🚨 New alert received: $message (doc: ${doc.id})');
+
+        final now = DateTime.now();
+        if (mounted) {
+          setState(() {
+            _lastAlertMessage = message;
+            _lastAlertTime = now;
+          });
+        }
+
+        // Show local push notification
+        await FcmService.showEmergencyLocalNotification(message: message);
+
+        // Show in-app snackbar
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Row(
+                children: [
+                  const Icon(Icons.warning_rounded, color: Colors.white),
+                  const SizedBox(width: 10),
+                  Expanded(child: Text(message)),
+                ],
+              ),
+              backgroundColor: AppColors.primaryRed,
+              duration: const Duration(seconds: 5),
+            ),
+          );
+        }
+
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString('last_alert_doc_id', doc.id);
+        await prefs.setString('last_alert_message', message);
+        await prefs.setInt('last_alert_ms', now.millisecondsSinceEpoch);
+
+        // Only process the latest new alert, break after first
+        break;
       }
-
-      final doc = snapshot.docs.first;
-      if (doc.id == _lastAlertDocId) {
-        return;
-      }
-
-      _lastAlertDocId = doc.id;
-      final data = doc.data();
-      final message = (data['message'] ?? FcmService.emergencyMessage).toString();
-
-      final now = DateTime.now();
-      if (mounted) {
-        setState(() {
-          _lastAlertMessage = message;
-          _lastAlertTime = now;
-        });
-      }
-
-      await FcmService.showEmergencyLocalNotification(message: message);
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(message)),
-        );
-      }
-
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('last_alert_doc_id', doc.id);
-      await prefs.setString('last_alert_message', message);
-      await prefs.setInt('last_alert_ms', now.millisecondsSinceEpoch);
+    }, onError: (e) {
+      debugPrint('Alert listener error: $e');
     });
   }
 
@@ -159,15 +209,22 @@ class _DashboardScreenState extends State<DashboardScreen>
       final snapshot = await FirebaseFirestore.instance
           .collection('alerts')
           .where('user_id', isEqualTo: userId)
-          .orderBy('timestamp', descending: true)
-          .limit(1)
+          .limit(5)
           .get();
 
       if (snapshot.docs.isEmpty) {
         return;
       }
 
-      final doc = snapshot.docs.first;
+      // Sort by timestamp client-side to find the latest
+      final docs = snapshot.docs.toList();
+      docs.sort((a, b) {
+        final aTime = (a.data()['timestamp'] as Timestamp?)?.toDate() ?? DateTime(0);
+        final bTime = (b.data()['timestamp'] as Timestamp?)?.toDate() ?? DateTime(0);
+        return bTime.compareTo(aTime); // descending
+      });
+
+      final doc = docs.first;
       if (doc.id == lastSeenId) {
         return;
       }
@@ -208,6 +265,7 @@ class _DashboardScreenState extends State<DashboardScreen>
     if (!serviceEnabled) {
       if (!mounted) return;
       setState(() => trackingStatus = "Location services disabled");
+      await Geolocator.openLocationSettings();
       return;
     }
 
@@ -217,6 +275,9 @@ class _DashboardScreenState extends State<DashboardScreen>
       if (permission == LocationPermission.denied) {
         if (!mounted) return;
         setState(() => trackingStatus = "Location denied");
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Location permission is required to receive nearby ambulance alerts.')),
+        );
         return;
       }
     }
@@ -224,6 +285,10 @@ class _DashboardScreenState extends State<DashboardScreen>
     if (permission == LocationPermission.deniedForever) {
       if (!mounted) return;
       setState(() => trackingStatus = "Location permanently denied");
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Enable location permission from Settings to continue live safety alerts.')),
+      );
+      await Geolocator.openAppSettings();
       return;
     } 
 
@@ -263,6 +328,12 @@ class _DashboardScreenState extends State<DashboardScreen>
 
   Future<void> _toggleEmergency() async {
     final nextState = !isEmergencyActive;
+
+    // Push latest known location before enabling emergency for faster first alert.
+    if (nextState && lat != null && lon != null) {
+      await ApiService.updateLocation(lat!, lon!);
+    }
+
     final updated = await ApiService.toggleEmergency(nextState);
     if (!mounted) return;
 
@@ -289,15 +360,15 @@ class _DashboardScreenState extends State<DashboardScreen>
 
   void _startProximityScanner() {
     _proximityTimer?.cancel();
-    _runAmbulanceAlertCycle();
-    _proximityTimer = Timer.periodic(const Duration(seconds: 5), (timer) {
+    _runAmbulanceAlertCycle(forceImmediate: true);
+    _proximityTimer = Timer.periodic(const Duration(seconds: 2), (timer) {
       _runAmbulanceAlertCycle();
     });
   }
 
-  Future<void> _runAmbulanceAlertCycle() async {
+  Future<void> _runAmbulanceAlertCycle({bool forceImmediate = false}) async {
     try {
-      await ApiService.processAmbulanceAlerts();
+      await ApiService.processAmbulanceAlerts(forceImmediate: forceImmediate);
     } catch (e) {
       debugPrint('Ambulance alert cycle failed: $e');
     }
@@ -321,11 +392,23 @@ class _DashboardScreenState extends State<DashboardScreen>
           IconButton(
             icon: const Icon(Icons.logout),
             onPressed: () async {
-              final prefs = await SharedPreferences.getInstance();
-              await prefs.clear();
-              // TODO: Stop background service (re-enable after notification fix)
-              // final service = FlutterBackgroundService();
-              // service.invoke("stopService");
+              if (_isLoggingOut) {
+                return;
+              }
+
+              _isLoggingOut = true;
+              _locationTimer?.cancel();
+              _proximityTimer?.cancel();
+              await _alertsSubscription?.cancel();
+              _alertsSubscription = null;
+
+              if (role == 'driver' && isEmergencyActive) {
+                await ApiService.toggleEmergency(false);
+              }
+
+              await FcmService.dispose();
+
+              await AuthService.logout();
               if (!context.mounted) return;
               Navigator.of(context).pushReplacementNamed('/login');
             },
@@ -340,32 +423,6 @@ class _DashboardScreenState extends State<DashboardScreen>
             _buildUserHeader(),
             const SizedBox(height: 16),
             _buildTrackingStatusCard(),
-            if (_fcmToken != null) ...[
-              const SizedBox(height: 16),
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                decoration: BoxDecoration(
-                  color: Colors.grey.withValues(alpha: 0.12),
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: Colors.grey.withValues(alpha: 0.3)),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      "Device FCM Token (Tap to copy/view):",
-                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.blueGrey),
-                    ),
-                    const SizedBox(height: 6),
-                    SelectableText(
-                      _fcmToken!,
-                      style: const TextStyle(fontSize: 10, color: Colors.black87),
-                    ),
-                  ],
-                ),
-              ),
-            ],
             const SizedBox(height: 30),
             _buildLocationCard(),
             const SizedBox(height: 40),
@@ -383,14 +440,14 @@ class _DashboardScreenState extends State<DashboardScreen>
       children: [
         Text(
           "Welcome back,",
-          style: TextStyle(color: AppColors.darkBlue.withValues(alpha: 0.7)),
+          style: TextStyle(color: AppColors.primaryBlue.withValues(alpha: 0.7)),
         ),
         Text(
           name,
           style: const TextStyle(
             fontSize: 28,
             fontWeight: FontWeight.bold,
-            color: AppColors.darkBlue,
+            color: AppColors.primaryBlue,
           ),
         ),
         Container(
@@ -398,8 +455,8 @@ class _DashboardScreenState extends State<DashboardScreen>
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
           decoration: BoxDecoration(
             color: role == 'driver'
-                ? AppColors.primaryEmergency
-                : AppColors.accentMedium,
+                ? AppColors.primaryRed
+                : AppColors.accentBlue,
             borderRadius: BorderRadius.circular(20),
           ),
           child: Text(
@@ -434,7 +491,7 @@ class _DashboardScreenState extends State<DashboardScreen>
         children: [
           Row(
             children: [
-              const Icon(Icons.location_on, color: AppColors.primaryEmergency),
+              const Icon(Icons.location_on, color: AppColors.primaryRed),
               const SizedBox(width: 10),
               const Text(
                 "Current Status",
@@ -475,7 +532,7 @@ class _DashboardScreenState extends State<DashboardScreen>
 
     final statusColor = isIssue
         ? Colors.orange
-        : (isEmergency ? AppColors.primaryEmergency : Colors.green);
+        : (isEmergency ? AppColors.primaryRed : Colors.green);
 
     return Container(
       width: double.infinity,
@@ -523,7 +580,7 @@ class _DashboardScreenState extends State<DashboardScreen>
           style: const TextStyle(
             fontSize: 18,
             fontWeight: FontWeight.bold,
-            color: AppColors.darkBlue,
+            color: AppColors.primaryBlue,
           ),
         ),
       ],
@@ -548,11 +605,11 @@ class _DashboardScreenState extends State<DashboardScreen>
                 shape: BoxShape.circle,
                 color: isEmergencyActive
                     ? Colors.white
-                    : AppColors.primaryEmergency,
-                border: Border.all(color: AppColors.primaryEmergency, width: 8),
+                    : AppColors.primaryRed,
+                border: Border.all(color: AppColors.primaryRed, width: 8),
                 boxShadow: [
                   BoxShadow(
-                    color: AppColors.primaryEmergency.withValues(alpha: 0.3),
+                    color: AppColors.primaryRed.withValues(alpha: 0.3),
                     blurRadius: isEmergencyActive ? 30 : 10,
                     spreadRadius: isEmergencyActive ? 10 : 2,
                   ),
@@ -568,7 +625,7 @@ class _DashboardScreenState extends State<DashboardScreen>
                           : Icons.radio_button_checked,
                       size: 50,
                       color: isEmergencyActive
-                          ? AppColors.primaryEmergency
+                          ? AppColors.primaryRed
                           : Colors.white,
                     ),
                     const SizedBox(height: 10),
@@ -581,7 +638,7 @@ class _DashboardScreenState extends State<DashboardScreen>
                         fontSize: 14,
                         fontWeight: FontWeight.bold,
                         color: isEmergencyActive
-                            ? AppColors.primaryEmergency
+                            ? AppColors.primaryRed
                             : Colors.white,
                       ),
                     ),
@@ -597,7 +654,7 @@ class _DashboardScreenState extends State<DashboardScreen>
                 : "Standby mode - Ready for calls",
             style: TextStyle(
               color: isEmergencyActive
-                  ? AppColors.primaryEmergency
+                  ? AppColors.primaryRed
                   : Colors.grey,
               fontWeight: FontWeight.bold,
             ),
@@ -611,12 +668,12 @@ class _DashboardScreenState extends State<DashboardScreen>
     return Container(
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
-        color: AppColors.accentLight.withValues(alpha: 0.3),
+        color: AppColors.surfaceCard.withValues(alpha: 0.3),
         borderRadius: BorderRadius.circular(15),
       ),
       child: Row(
         children: [
-          const Icon(Icons.shield, color: AppColors.accentMedium),
+          const Icon(Icons.shield, color: AppColors.accentBlue),
           const SizedBox(width: 15),
           Expanded(
             child: Column(
@@ -625,7 +682,7 @@ class _DashboardScreenState extends State<DashboardScreen>
                 const Text(
                   "Public mode active. Your location is being securely shared for emergency response.",
                   style: TextStyle(
-                    color: AppColors.darkBlue,
+                    color: AppColors.primaryBlue,
                     fontWeight: FontWeight.w500,
                   ),
                 ),
@@ -636,7 +693,7 @@ class _DashboardScreenState extends State<DashboardScreen>
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(
-                      color: AppColors.darkBlue,
+                      color: AppColors.primaryBlue,
                       fontSize: 12,
                       fontWeight: FontWeight.w700,
                     ),
@@ -646,9 +703,9 @@ class _DashboardScreenState extends State<DashboardScreen>
                     Text(
                       'Received: ${_lastAlertTime!.toLocal().toString().split('.').first}',
                       style: const TextStyle(
-                        color: Colors.black54,
                         fontSize: 11,
                         fontWeight: FontWeight.w600,
+                        color: AppColors.primaryBlue,
                       ),
                     ),
                   ],
