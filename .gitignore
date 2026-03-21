@@ -1,0 +1,7 @@
+# Local secrets
+backend/.env
+backend/.env.*
+!backend/.env.example
+
+# Firebase admin SDK credentials (local only)
+*firebase-adminsdk*.json
